@@ -6,6 +6,7 @@ import json
 import uuid
 import webob
 import base64
+import hashlib
 import httplib
 from collections import namedtuple
 
@@ -90,6 +91,16 @@ class InvalidContentTypeError(Error):
     reason = 'Invalid Content-Type Header'
 
 
+class ChecksumAlgorisumsNotSuppertedError(Error):
+    status_code = httplib.BAD_REQUEST
+    reason = 'Bad Request'
+
+
+class ChecksumMismatchError(Error):
+    status_code = 460
+    reason = 'Checksum Mismatch'
+
+
 class FileLockedError(Error):
     status_code = httplib.LOCKED
     reason = 'File Currently Locked'
@@ -111,16 +122,16 @@ class ModifyFinalError(Error):
 
 Env = namedtuple('Env', ['req', 'resp', 'values'])
 
-class TusFilter(object):
 
+class TusFilter(object):
     versions = ['1.0.0']
     max_size = 2 ** 30   # 1G
-    checksum_algorisum = ['sha1']
+    checksum_algorisums = ['sha1']
     extensions = [
         'creation',
         'expiration',
         'termination',
-        # 'checksum',                  # todo
+        'checksum',
         # 'creation-defer-length',     # todo
         # 'checksum-trailer',          # todo
         # 'concatenation',             # todo
@@ -195,8 +206,7 @@ class TusFilter(object):
     def options(self, env):
         env.resp.headers['Tus-Version'] = ','.join(self.versions)
         env.resp.headers['Tus-Max-Size'] = str(self.max_size)
-        # todo: waitting for checksum extension
-        # self.resp.headers['Tus-Checksum-Algorithm'] = ','.join(self.checksum_algorisum)
+        env.resp.headers['Tus-Checksum-Algorithm'] = ','.join(self.checksum_algorisums)
         env.resp.headers['Tus-Extension'] = ','.join(self.extensions)
         env.resp.status = httplib.NO_CONTENT
 
@@ -246,7 +256,7 @@ class TusFilter(object):
         env.resp.headers['Upload-Length'] = str(upload_length)
         if upload_metadata:
             env.resp.headers['Upload-Metadata'] = str(','.join(['%s %s' % (t[0], base64.standard_b64encode(t[1]))
-                                                                 for t in upload_metadata.items()]))
+                                                                for t in upload_metadata.items()]))
         env.resp.headers['Cache-Control'] = 'no-store'
         env.resp.status = httplib.OK
 
@@ -267,6 +277,15 @@ class TusFilter(object):
             raise ConflictUploadOffsetError()
         env.values['upload_offset'] = offset
 
+        upload_checksum = env.req.headers.get('Upload-Checksum')
+        if upload_checksum:
+            algorisum, checksum_base64 = upload_checksum.strip().split(None, 1)
+            if algorisum not in self.checksum_algorisums:
+                raise ChecksumAlgorisumsNotSuppertedError()
+            checksum = base64.standard_b64decode(checksum_base64)
+            body = env.req.body
+            if checksum != hashlib.sha1(body).digest():
+                raise ChecksumMismatchError()
         current_offset = self.write_data(env)
         if current_offset == self.get_end_length(env):
             self.finish_upload(env)
@@ -378,21 +397,17 @@ class TusFilter(object):
     def write_data(self, env):
         fpath = self.get_fpath(env)
         info_path = fpath + '.info'
-        body = env.req.body
+        body = env.req.body_file
         if not os.path.exists(fpath) or not os.path.exists(info_path):
             raise NotFoundError()
         with open(fpath, 'ab+') as f:
             f.seek(0, os.SEEK_END)
-            if hasattr(body, 'read'):
-                if hasattr(body, 'seek'):
-                    body.seek(0)
-                while True:
-                    chunk = body.read(2 << 16)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-            else:
-                f.write(body)
+            body.seek(0)
+            while True:
+                chunk = body.read(2 << 16)
+                if not chunk:
+                    break
+                f.write(chunk)
             offset = f.tell()
 
         os.utime(info_path, None)
