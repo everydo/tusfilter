@@ -168,11 +168,8 @@ class TusFilter(object):
         return resp(environ, start_response)
 
     def handle(self, env):
-        try:
-            x_method = env.req.headers.get('X-HTTP-Method-Override')
-        except AttributeError:
-            x_method = None
-        method = (x_method or env.req.method).upper()
+        x_method = env.req.headers.get('X-HTTP-Method-Override')
+        method = x_method or env.req.method
 
         path_parts = env.req.path.split('/', 2)
         uid = path_parts[2] if 2 < len(path_parts) else None
@@ -187,7 +184,7 @@ class TusFilter(object):
             if version not in self.versions:
                 raise UnsupportedVersionError()
         version = version or self.versions[0]   # OPTIONS version maybe None
-        env.values['version'] = version        # for multi versions
+        env.values['version'] = version
         env.resp.headers['Tus-Resumable'] = version
 
         if method == 'POST':
