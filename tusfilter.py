@@ -125,7 +125,6 @@ Env = namedtuple('Env', ['req', 'resp', 'values'])
 
 class TusFilter(object):
     versions = ['1.0.0']
-    max_size = 2 ** 30   # 1G
     checksum_algorisums = ['sha1']
     extensions = [
         'creation',
@@ -138,12 +137,13 @@ class TusFilter(object):
         # 'concatenation-unfinished',  # todo
     ]
 
-    def __init__(self, app, upload_path, tmp_dir='/tmp/upload', expire=60*60*60, send_file=False):
+    def __init__(self, app, upload_path, tmp_dir='/tmp/upload', expire=60*60*60, send_file=False, max_size=2**30):
         self.app = app
         self.tmp_dir = tmp_dir
         self.upload_path = upload_path
         self.expire = expire
         self.send_file = send_file
+        self.max_size = max_size
 
         if not os.path.exists(tmp_dir):
             os.makedirs(tmp_dir)
