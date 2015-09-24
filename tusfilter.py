@@ -26,6 +26,11 @@ class NotImplementedError(Error):
     reason = 'Feature Not Implemented'
 
 
+class InvalidUploadPathError(Error):
+    status_code = httplib.BAD_REQUEST
+    reason = 'Invalid Upload Path'
+
+
 class MethodNotAllowedError(Error):
     status_code = httplib.METHOD_NOT_ALLOWED
     reason = 'Method Not Allowed'
@@ -64,6 +69,20 @@ class ConflictUploadLengthError(Error):
 class MissingUploadLengthError(Error):
     status_code = httplib.BAD_REQUEST
     reason = 'Missing Upload-Length Header'
+
+
+class ExceedUploadLengthError(Error):
+    status_code = httplib.BAD_REQUEST
+    reason = 'Exceed Upload-Length'
+
+
+class InvalidUploadDeferLengthError(Error):
+    status_code = httplib.BAD_REQUEST
+    reason = 'Invalid Upload-Defer-Length Header'
+
+class ConflictUploadDeferLengthError(Error):
+    status_code = httplib.BAD_REQUEST
+    reason = 'Conflict Upload-Defer-Length Header'
 
 
 class InvalidUploadOffsetError(Error):
@@ -131,7 +150,7 @@ class TusFilter(object):
         'expiration',
         'termination',
         'checksum',
-        # 'creation-defer-length',     # todo
+        'creation-defer-length',
         # 'checksum-trailer',          # todo
         # 'concatenation',             # todo
         # 'concatenation-unfinished',  # todo
@@ -208,20 +227,9 @@ class TusFilter(object):
         env.resp.status = httplib.NO_CONTENT
 
     def post(self, env):
-        upload_length = env.req.headers.get('Upload-Length')
-        # todo: waitting for creation-defer-length extension
-        # upload_defer_length = self.req.headers.get('Upload-Defer-Length')
-        if not upload_length:
-            raise MissingUploadLengthError()
-        try:
-            length = int(upload_length)
-        except ValueError:
-            raise InvalidUploadLengthError()
-        if length < 0:
-            raise InvalidUploadLengthError()
-        if length > self.max_size:
-            raise MaxSizeExceededError()
-        env.values['upload_length'] = length
+        if env.values['uid']:
+            raise InvalidUploadPathError()
+        self.check_upload_length(env)
 
         upload_metadata = dict()
         upload_metadata_str = env.req.headers.get('Upload-Metadata')
@@ -236,10 +244,7 @@ class TusFilter(object):
                     raise InvalidUploadMetadataError()
         env.values['upload_metadata'] = upload_metadata
 
-        if env.values['uid']:
-            self.check_files(env)
-        else:
-            self.create_files(env)
+        self.create_files(env)
 
         env.resp.headers['Upload-Expires'] = self.get_fexpires(env)
         env.resp.headers['Location'] = os.path.join(self.upload_path, env.values['uid'])
@@ -250,7 +255,10 @@ class TusFilter(object):
         upload_length = self.get_end_length(env)
         upload_metadata = self.get_metadata(env)
         env.resp.headers['Upload-Offset'] = str(upload_offset)
-        env.resp.headers['Upload-Length'] = str(upload_length)
+        if upload_length == -1:
+            env.resp.headers['Upload-Defer-Length'] = '1'
+        else:
+            env.resp.headers['Upload-Length'] = str(upload_length)
         if upload_metadata:
             env.resp.headers['Upload-Metadata'] = str(','.join(['%s %s' % (t[0], base64.standard_b64encode(t[1]))
                                                                 for t in upload_metadata.items()]))
@@ -260,19 +268,7 @@ class TusFilter(object):
     def patch(self, env):
         if env.req.headers.get('Content-Type') != 'application/offset+octet-stream':
             raise InvalidContentTypeError()
-
-        upload_offset = env.req.headers.get('Upload-Offset')
-        if not upload_offset:
-            raise MissingUploadOffsetError()
-        try:
-            offset = int(upload_offset)
-        except ValueError:
-            raise InvalidUploadOffsetError()
-        if offset < 0:
-            raise InvalidUploadOffsetError()
-        if offset != self.get_current_offset(env):
-            raise ConflictUploadOffsetError()
-        env.values['upload_offset'] = offset
+        self.check_upload_length(env, post=False)
 
         upload_checksum = env.req.headers.get('Upload-Checksum')
         if upload_checksum:
@@ -286,10 +282,38 @@ class TusFilter(object):
         current_offset = self.write_data(env)
         if current_offset == self.get_end_length(env):
             self.finish_upload(env)
+        if current_offset > env.values['upload_length'] > 0:
+            raise ExceedUploadLengthError()
 
         env.resp.headers['Upload-Offset'] = str(current_offset)
         env.resp.headers['Upload-Expires'] = self.get_fexpires(env)
         env.resp.status = httplib.NO_CONTENT
+
+    def check_upload_length(self, env, post=True):
+        upload_length = env.req.headers.get('Upload-Length')
+        upload_defer_length = env.req.headers.get('Upload-Defer-Length')
+        if upload_defer_length and upload_length:
+            raise ConflictUploadDeferLengthError()
+        if post and not (upload_length or upload_defer_length):
+            raise MissingUploadLengthError()
+
+        if upload_defer_length:
+            if upload_defer_length != '1':
+                raise InvalidUploadDeferLengthError()
+            env.values['upload_length'] = -1   # defer flag (== -1) or real length (>= 0)
+        elif upload_length:
+            try:
+                length = int(upload_length)
+            except ValueError:
+                raise InvalidUploadLengthError()
+            if length < 0:
+                raise InvalidUploadLengthError()
+            if length > self.max_size:
+                raise MaxSizeExceededError()
+            env.values['upload_length'] = length
+        else:
+            # in PATCH
+            env.values['upload_length'] = self.get_end_length(env)
 
     def delete(self, env):
         self.delete_files(env)
@@ -337,19 +361,25 @@ class TusFilter(object):
     def check_files(self, env):
         fpath = self.get_fpath(env)
         info_path = fpath + '.info'
-
         if not os.path.exists(fpath) or not os.path.exists(fpath+'.info'):
             raise NotFoundError()
-
         with open(info_path, 'r') as f:
             config = json.load(f)
+        modify_flag = False
 
         length = env.values['upload_length']
-        if length != config['upload_length']:
+        cur_length = config['upload_length']
+        if cur_length == -1 and length != -1:
+            config['upload_length'] = length
+            modify_flag = True
+        elif cur_length != -1 and length != cur_length:
             raise ConflictUploadLengthError()
 
         if config['upload_metadata'] != env.values['upload_metadata']:
             config['upload_metadata'].update(env.values['upload_metadata'])
+            modify_flag = True
+
+        if modify_flag:
             with open(info_path, 'w') as f:
                 json.dump(config, f, indent=4)
 
@@ -397,6 +427,20 @@ class TusFilter(object):
         body = env.req.body_file
         if not os.path.exists(fpath) or not os.path.exists(info_path):
             raise NotFoundError()
+
+        with open(info_path, 'r') as f:
+            config = json.load(f)
+        cur_length = config['upload_length']
+        length = env.values['upload_length']
+        if cur_length != -1 and length != cur_length:
+            raise ConflictUploadLengthError()
+        if cur_length == -1 and length >= 0:
+            config['upload_length'] = length
+            with open(info_path) as f:
+                json.dump(config, f)
+        else:
+            os.utime(info_path, None)
+
         with open(fpath, 'ab+') as f:
             f.seek(0, os.SEEK_END)
             body.seek(0)
@@ -407,7 +451,6 @@ class TusFilter(object):
                 f.write(chunk)
             offset = f.tell()
 
-        os.utime(info_path, None)
         return offset
 
     def finish_error(self, env, error):
