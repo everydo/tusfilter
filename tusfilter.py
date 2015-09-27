@@ -254,13 +254,19 @@ class TusFilter(object):
         upload_length = self.get_end_length(env)
         upload_metadata = self.get_metadata(env)
         env.resp.headers['Upload-Offset'] = str(upload_offset)
+
         if upload_length == -1:
             env.resp.headers['Upload-Defer-Length'] = '1'
         else:
             env.resp.headers['Upload-Length'] = str(upload_length)
+
         if upload_metadata:
             env.resp.headers['Upload-Metadata'] = str(','.join(['%s %s' % (t[0], base64.standard_b64encode(t[1]))
                                                                 for t in upload_metadata.items()]))
+        parts = self.get_parts(env)
+        if parts:
+            env.resp.headers['Upload-Concat'] = 'final;' + ' '.join([self.get_url_from_uid(env, uid) for uid in parts])
+
         env.resp.headers['Cache-Control'] = 'no-store'
         env.resp.status = httplib.OK
 
@@ -349,6 +355,12 @@ class TusFilter(object):
         if '/' in uid:
             raise InvalidUidError()
         return uid
+
+    def get_url_from_uid(self, env, uid=None):
+        if not uid:
+            uid = env.values['uid']
+        url = os.path.join(self.upload_path, uid)
+        return url
 
     def delete(self, env):
         self.delete_files(env)
@@ -456,22 +468,26 @@ class TusFilter(object):
         return os.path.getsize(fpath)
 
     def get_end_length(self, env):
-        info_path = self.get_info_path(env)
-
-        if not os.path.exists(info_path):
-            raise NotFoundError()
-        with open(info_path, 'r') as f:
-            config = json.load(f)
-        return config['upload_length']
+        self.load_info_data(env)
+        return env.values['info']['upload_length']
 
     def get_metadata(self, env):
-        info_path = self.get_info_path(env)
+        self.load_info_data(env)
+        return env.values['info']['upload_metadata']
 
+    def get_parts(self, env):
+        self.load_info_data(env)
+        return env.values['info']['parts']
+
+    def load_info_data(self, env):
+        if 'info' in env.values:
+            return
+        info_path = self.get_info_path(env)
         if not os.path.exists(info_path):
             raise NotFoundError()
         with open(info_path, 'r') as f:
-            config = json.load(f)
-        return config['upload_metadata']
+            info = json.load(f)
+        env.values['info'] = info
 
     def get_fexpires(self, env):
         fpath = self.get_fpath(env)
@@ -489,15 +505,15 @@ class TusFilter(object):
             raise NotFoundError()
 
         with open(info_path, 'r') as f:
-            config = json.load(f)
-        cur_length = config['upload_length']
+            info = json.load(f)
+        cur_length = info['upload_length']
         length = env.values['upload_length']
         if cur_length != -1 and length != cur_length:
             raise ConflictUploadLengthError()
         if cur_length == -1 and length >= 0:
-            config['upload_length'] = length
+            info['upload_length'] = length
             with open(info_path) as f:
-                json.dump(config, f)
+                json.dump(info, f)
         else:
             os.utime(info_path, None)
 
