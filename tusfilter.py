@@ -142,6 +142,11 @@ class InvalidConcatError(Error):
     reason = 'Invalid Upload-Concat Header'
 
 
+class InvalidMethodError(Error):
+    status_code = httplib.FORBIDDEN
+    reason = 'Forbidden'
+
+
 class ModifyFinalError(Error):
     status_code = httplib.FORBIDDEN
     reason = 'Modifying A Final Upload Is Not Allowed'
@@ -240,8 +245,8 @@ class TusFilter(object):
         if env.values['uid']:
             raise InvalidUploadPathError()
 
-        self.check_upload_length(env)
         self.check_concatenation(env)
+        self.check_upload_length(env)
         self.check_metadata(env)
         self.create_files(env)
 
@@ -253,10 +258,13 @@ class TusFilter(object):
         upload_offset = self.get_current_offset(env)
         upload_length = self.get_end_length(env)
         upload_metadata = self.get_metadata(env)
+
         env.resp.headers['Upload-Offset'] = str(upload_offset)
 
         if upload_length == -1:
             env.resp.headers['Upload-Defer-Length'] = '1'
+        elif upload_length == -2:
+            pass
         else:
             env.resp.headers['Upload-Length'] = str(upload_length)
 
@@ -273,6 +281,7 @@ class TusFilter(object):
     def patch(self, env):
         if env.req.headers.get('Content-Type') != 'application/offset+octet-stream':
             raise InvalidContentTypeError()
+        self.check_concatenation(env, post=False)
         self.check_upload_length(env, post=False)
 
         upload_checksum = env.req.headers.get('Upload-Checksum')
@@ -297,6 +306,8 @@ class TusFilter(object):
     def check_upload_length(self, env, post=True):
         upload_length = env.req.headers.get('Upload-Length')
         upload_defer_length = env.req.headers.get('Upload-Defer-Length')
+        if upload_length and 'parts' in env.values:
+            raise InvalidUploadLengthError()
         if upload_defer_length and upload_length:
             raise ConflictUploadDeferLengthError()
         if post and not (upload_length or upload_defer_length):
@@ -316,16 +327,20 @@ class TusFilter(object):
             if length > self.max_size:
                 raise MaxSizeExceededError()
             env.values['upload_length'] = length
+        elif 'parts' in env.values:
+            env.values['upload_length'] = -2   # Upload-Concat: final
         else:
             # in PATCH
             env.values['upload_length'] = self.get_end_length(env)
 
-    def check_concatenation(self, env):
+    def check_concatenation(self, env, post=True):
         upload_concat = env.req.headers.get('Upload-Concat')
         if not upload_concat:
             return
         if upload_concat == 'partial':
             env.values['partial'] = True
+            if not post:
+                raise InvalidMethodError()
         elif upload_concat.startswith('final;'):
             parts = upload_concat[len('final:'):].strip().split()
             env.values['parts'] = [self.get_uid_from_url(p) for p in parts]
@@ -379,10 +394,10 @@ class TusFilter(object):
 
     def create_files(self, env):
         self.cleanup()
-        config = dict()
-        config['partial'] = env.values.get('partial', False)
-        config['parts'] = env.values.get('parts', None)
-        config['upload_metadata'] = env.values.get('upload_metadata', None)
+        info = dict()
+        info['partial'] = env.values.get('partial', False)
+        info['parts'] = env.values.get('parts', None)
+        info['upload_metadata'] = env.values.get('upload_metadata', None)
 
         uid = uuid.uuid4().hex
         fpath = self.get_fpath(env, uid)
@@ -393,21 +408,24 @@ class TusFilter(object):
         env.values['uid'] = uid
         with open(fpath, 'wb') as _:
             pass
-        if config['parts']:
+        if info['parts']:
             self.concat_parts(env, fpath)
 
-        config['upload_length'] = env.values['upload_length']
+        info['upload_length'] = env.values['upload_length']
         with open(info_path, 'w') as f:
-            json.dump(config, f, indent=4)
+            json.dump(info, f, indent=4)
         return uid
 
-    def concat_parts(self, env, fpath):
+    def check_parts(self, env):
         parts = env.values['parts']
         for uid in parts:
             info_path = self.get_info_path(env, uid)
             if os.path.exists(info_path):
                 raise UploadNotFinishedError()
 
+    def concat_parts(self, env, fpath):
+        self.check_parts(env)
+        parts = env.values['parts']
         with open(fpath, 'wb') as f:
             for uid in parts:
                 uid_fp = open(self.get_fpath(env, uid), 'rb')
@@ -469,7 +487,18 @@ class TusFilter(object):
 
     def get_end_length(self, env):
         self.load_info_data(env)
-        return env.values['info']['upload_length']
+        parts = env.values['info']['parts']
+        if not parts:
+            return env.values['info']['upload_length']
+        upload_length = 0
+        for uid in parts:
+            uid_info_path = self.get_info_path(env, uid)
+            with open(uid_info_path, 'r') as f:
+                uid_info = json.load(f)
+                if uid_info['upload_length'] == -1:
+                    return -2  # Upload-Concat
+                upload_length += uid_info['upload_length']
+        return upload_length
 
     def get_metadata(self, env):
         self.load_info_data(env)
@@ -478,6 +507,10 @@ class TusFilter(object):
     def get_parts(self, env):
         self.load_info_data(env)
         return env.values['info']['parts']
+
+    def is_partial(self, env):
+        self.load_info_data(env)
+        return env.values['info']['partial']
 
     def load_info_data(self, env):
         if 'info' in env.values:
