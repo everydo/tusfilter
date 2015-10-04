@@ -6,6 +6,7 @@ import json
 import uuid
 import webob
 import base64
+import shutil
 import hashlib
 import httplib
 import urlparse
@@ -152,7 +153,11 @@ class ModifyFinalError(Error):
     reason = 'Modifying A Final Upload Is Not Allowed'
 
 
-Env = namedtuple('Env', ['req', 'resp', 'values'])
+# req: webob request object
+# resp: webob response object
+# temp: temp data
+# info: upload info, persistent data in info file
+Env = namedtuple('Env', ['req', 'resp', 'temp', 'info'])
 
 
 class TusFilter(object):
@@ -183,8 +188,9 @@ class TusFilter(object):
     def __call__(self, environ, start_response):
         req = webob.Request(environ)
         resp = webob.Response()
-        values = dict(upload_finished=False)
-        env = Env(req=req, resp=resp, values=values)
+        temp = dict(upload_finished=False, info_loaded=False)
+        info = dict()
+        env = Env(req=req, resp=resp, temp=temp, info=info)
         if not req.path.startswith(self.upload_path):
             return self.app(environ, start_response)
         try:
@@ -192,11 +198,11 @@ class TusFilter(object):
         except Error as e:
             self.finish_error(env, e)
 
-        if not env.values['upload_finished']:
+        if not env.temp['upload_finished']:
             return resp(environ, start_response)
 
         app_resp = req.get_response(self.app)
-        if env.values.get('parts') and app_resp.status == httplib.OK:
+        if env.info.get('parts') and app_resp.status == httplib.OK:
             return resp(environ, start_response)
 
         self.delete_info_file(env)
@@ -207,9 +213,9 @@ class TusFilter(object):
         method = x_method or env.req.method
 
         uid = self.get_uid_from_url(env.req.url)
-        if method not in ['POST', 'OPTIONS'] and not uid:
+        if not uid and method not in ['POST', 'OPTIONS']:
             raise MissingUidError()
-        env.values['uid'] = uid
+        env.temp['uid'] = uid
 
         version = env.req.headers.get('Tus-Resumable')
         if method != 'OPTIONS':
@@ -218,7 +224,7 @@ class TusFilter(object):
             if version not in self.versions:
                 raise UnsupportedVersionError()
         version = version or self.versions[0]   # OPTIONS version maybe None
-        env.values['version'] = version
+        env.temp['version'] = version
         env.resp.headers['Tus-Resumable'] = version
 
         if method == 'POST':
@@ -242,7 +248,7 @@ class TusFilter(object):
         env.resp.status = httplib.NO_CONTENT
 
     def post(self, env):
-        if env.values['uid']:
+        if env.temp['uid']:
             raise InvalidUploadPathError()
 
         self.check_concatenation(env)
@@ -251,7 +257,7 @@ class TusFilter(object):
         self.create_files(env)
 
         env.resp.headers['Upload-Expires'] = self.get_fexpires(env)
-        env.resp.headers['Location'] = os.path.join(self.upload_path, env.values['uid'])
+        env.resp.headers['Location'] = os.path.join(self.upload_path, env.temp['uid'])
         env.resp.status = httplib.CREATED
 
     def head(self, env):
@@ -269,8 +275,8 @@ class TusFilter(object):
             env.resp.headers['Upload-Length'] = str(upload_length)
 
         if upload_metadata:
-            env.resp.headers['Upload-Metadata'] = str(','.join(['%s %s' % (t[0], base64.standard_b64encode(t[1]))
-                                                                for t in upload_metadata.items()]))
+            env.resp.headers['Upload-Metadata'] = str(','.join(['%s %s' % (k, base64.standard_b64encode(v))
+                                                                for k, v in upload_metadata.items()]))
         parts = self.get_parts(env)
         if parts:
             env.resp.headers['Upload-Concat'] = 'final;' + ' '.join([self.get_url_from_uid(env, uid) for uid in parts])
@@ -281,12 +287,11 @@ class TusFilter(object):
     def patch(self, env):
         if env.req.headers.get('Content-Type') != 'application/offset+octet-stream':
             raise InvalidContentTypeError()
-        self.check_concatenation(env, post=False)
         self.check_upload_length(env, post=False)
 
         upload_checksum = env.req.headers.get('Upload-Checksum')
         if upload_checksum:
-            algorisum, checksum_base64 = upload_checksum.strip().split(None, 1)
+            algorisum, checksum_base64 = upload_checksum.split(None, 1)
             if algorisum not in self.checksum_algorisums:
                 raise ChecksumAlgorisumsNotSuppertedError()
             checksum = base64.standard_b64decode(checksum_base64)
@@ -296,17 +301,34 @@ class TusFilter(object):
         current_offset = self.write_data(env)
         if current_offset == self.get_end_length(env):
             self.finish_upload(env)
-        if current_offset > env.values['upload_length'] > 0:
+        if current_offset > env.info['upload_length'] > 0:
             raise ExceedUploadLengthError()
 
         env.resp.headers['Upload-Offset'] = str(current_offset)
         env.resp.headers['Upload-Expires'] = self.get_fexpires(env)
         env.resp.status = httplib.NO_CONTENT
 
+    def check_concatenation(self, env):
+        upload_concat = env.req.headers.get('Upload-Concat')
+        if not upload_concat:
+            return
+        if upload_concat == 'partial':
+            env.info['partial'] = True
+        elif upload_concat.startswith('final;'):
+            parts = upload_concat[len('final:'):].strip().split()
+            env.info['parts'] = [self.get_uid_from_url(p) for p in parts]
+        else:
+            raise InvalidConcatError()
+
     def check_upload_length(self, env, post=True):
+        '''
+        info[upload_length] >= 0 : real upload length
+        info[upload_length] == -1 : defer upload length flag
+        info[upload_length] == -2 : upload concat final flag
+        '''
         upload_length = env.req.headers.get('Upload-Length')
         upload_defer_length = env.req.headers.get('Upload-Defer-Length')
-        if upload_length and 'parts' in env.values:
+        if upload_length and 'parts' in env.info:
             raise InvalidUploadLengthError()
         if upload_defer_length and upload_length:
             raise ConflictUploadDeferLengthError()
@@ -316,7 +338,7 @@ class TusFilter(object):
         if upload_defer_length:
             if upload_defer_length != '1':
                 raise InvalidUploadDeferLengthError()
-            env.values['upload_length'] = -1   # defer flag (== -1) or real length (>= 0)
+            env.info['upload_length'] = -1
         elif upload_length:
             try:
                 length = int(upload_length)
@@ -326,46 +348,33 @@ class TusFilter(object):
                 raise InvalidUploadLengthError()
             if length > self.max_size:
                 raise MaxSizeExceededError()
-            env.values['upload_length'] = length
-        elif 'parts' in env.values:
-            env.values['upload_length'] = -2   # Upload-Concat: final
-        else:
-            # in PATCH
-            env.values['upload_length'] = self.get_end_length(env)
-
-    def check_concatenation(self, env, post=True):
-        upload_concat = env.req.headers.get('Upload-Concat')
-        if not upload_concat:
-            return
-        if upload_concat == 'partial':
-            env.values['partial'] = True
-            if not post:
-                raise InvalidMethodError()
-        elif upload_concat.startswith('final;'):
-            parts = upload_concat[len('final:'):].strip().split()
-            env.values['parts'] = [self.get_uid_from_url(p) for p in parts]
-        else:
-            raise InvalidConcatError()
+            env.info['upload_length'] = length
+        elif 'parts' in env.info:
+            env.info['upload_length'] = -2
+        elif not post:  # patch method
+            env.info['upload_length'] = self.get_end_length(env)
 
     def check_metadata(self, env):
-        upload_metadata = dict()
         upload_metadata_str = env.req.headers.get('Upload-Metadata')
         if not upload_metadata_str:
             return
-        upload_metadata_tuples = [v.strip().split() for v in upload_metadata_str.split(',')]
+        upload_metadata_tuples = [t.strip().split() for t in upload_metadata_str.split(',')]
+        upload_metadata = dict()
         for t in upload_metadata_tuples:
-            if len(t) != 2:
+            try:
+                k, v = t
+            except ValueError:
                 raise InvalidUploadMetadataError()
             try:
-                upload_metadata[t[0]] = base64.standard_b64decode(t[1])
+                upload_metadata[k] = base64.standard_b64decode(v)
             except:
                 raise InvalidUploadMetadataError()
-        env.values['upload_metadata'] = upload_metadata
+        env.info['upload_metadata'] = upload_metadata
 
     def get_uid_from_url(self, url):
         path = urlparse.urlparse(url).path
-        uid = path[len(self.upload_path):].lstrip('/')
-        if not uid:
+        uid = os.path.relpath(path, self.upload_path)
+        if uid == '.':
             return None
         if '/' in uid:
             raise InvalidUidError()
@@ -373,7 +382,7 @@ class TusFilter(object):
 
     def get_url_from_uid(self, env, uid=None):
         if not uid:
-            uid = env.values['uid']
+            uid = env.temp['uid']
         url = os.path.join(self.upload_path, uid)
         return url
 
@@ -389,35 +398,35 @@ class TusFilter(object):
             config = json.load(f)
         if config['partial']:
             return
-        env.values['upload_finished'] = True
+        env.temp['upload_finished'] = True
         env.req.body = self.get_fpath(env) if not self.send_file else open(self.get_fpath(env), 'rb').read()
 
     def create_files(self, env):
         self.cleanup()
         info = dict()
-        info['partial'] = env.values.get('partial', False)
-        info['parts'] = env.values.get('parts', None)
-        info['upload_metadata'] = env.values.get('upload_metadata', None)
+        info['partial'] = env.info.get('partial', False)
+        info['parts'] = env.info.get('parts')
+        info['upload_metadata'] = env.info.get('upload_metadata')
 
         uid = uuid.uuid4().hex
         fpath = self.get_fpath(env, uid)
-        info_path = self.get_info_path(env, uid)
         while os.path.exists(fpath):
             uid = uuid.uuid4().hex
             fpath = self.get_fpath(uid)
-        env.values['uid'] = uid
+        env.temp['uid'] = uid
         with open(fpath, 'wb') as _:
             pass
         if info['parts']:
             self.concat_parts(env, fpath)
 
-        info['upload_length'] = env.values['upload_length']
+        info['upload_length'] = env.info['upload_length']
+        info_path = self.get_info_path(env, uid)
         with open(info_path, 'w') as f:
             json.dump(info, f, indent=4)
         return uid
 
     def check_parts(self, env):
-        parts = env.values['parts']
+        parts = env.info['parts']
         for uid in parts:
             info_path = self.get_info_path(env, uid)
             if os.path.exists(info_path):
@@ -425,13 +434,12 @@ class TusFilter(object):
 
     def concat_parts(self, env, fpath):
         self.check_parts(env)
-        parts = env.values['parts']
+        parts = env.info['parts']
         with open(fpath, 'wb') as f:
             for uid in parts:
                 uid_fp = open(self.get_fpath(env, uid), 'rb')
-                f.write(uid_fp.read())
-
-        env.values['upload_length'] = os.path.getsize(fpath)
+                shutil.copyfileobj(uid_fp, f)
+        env.info['upload_length'] = os.path.getsize(fpath)
 
     def delete_files(self, env):
         fpath = self.get_fpath(env)
@@ -455,7 +463,7 @@ class TusFilter(object):
             config = json.load(f)
         modify_flag = False
 
-        length = env.values['upload_length']
+        length = env.info['upload_length']
         cur_length = config['upload_length']
         if cur_length == -1 and length != -1:
             config['upload_length'] = length
@@ -463,8 +471,8 @@ class TusFilter(object):
         elif cur_length != -1 and length != cur_length:
             raise ConflictUploadLengthError()
 
-        if config['upload_metadata'] != env.values['upload_metadata']:
-            config['upload_metadata'].update(env.values['upload_metadata'])
+        if config['upload_metadata'] != env.info['upload_metadata']:
+            config['upload_metadata'].update(env.info['upload_metadata'])
             modify_flag = True
 
         if modify_flag:
@@ -472,7 +480,7 @@ class TusFilter(object):
                 json.dump(config, f, indent=4)
 
     def get_fpath(self, env, uid=None):
-        uid = uid or env.values['uid']
+        uid = uid or env.temp['uid']
         return os.path.join(self.tmp_dir, uid)
 
     def get_info_path(self, env, uid=None):
@@ -487,9 +495,9 @@ class TusFilter(object):
 
     def get_end_length(self, env):
         self.load_info_data(env)
-        parts = env.values['info']['parts']
+        parts = env.info['parts']
         if not parts:
-            return env.values['info']['upload_length']
+            return env.info['upload_length']
         upload_length = 0
         for uid in parts:
             uid_info_path = self.get_info_path(env, uid)
@@ -502,25 +510,26 @@ class TusFilter(object):
 
     def get_metadata(self, env):
         self.load_info_data(env)
-        return env.values['info']['upload_metadata']
+        return env.info['upload_metadata']
 
     def get_parts(self, env):
         self.load_info_data(env)
-        return env.values['info']['parts']
+        return env.info['parts']
 
     def is_partial(self, env):
         self.load_info_data(env)
-        return env.values['info']['partial']
+        return env.info['partial']
 
     def load_info_data(self, env):
-        if 'info' in env.values:
+        if env.temp['info_loaded']:
             return
         info_path = self.get_info_path(env)
         if not os.path.exists(info_path):
             raise NotFoundError()
         with open(info_path, 'r') as f:
             info = json.load(f)
-        env.values['info'] = info
+        env.info.update(info)
+        env.temp['info_loaded'] = True
 
     def get_fexpires(self, env):
         fpath = self.get_fpath(env)
@@ -533,32 +542,29 @@ class TusFilter(object):
     def write_data(self, env):
         fpath = self.get_fpath(env)
         info_path = self.get_info_path(env)
-        body = env.req.body_file
         if not os.path.exists(fpath) or not os.path.exists(info_path):
             raise NotFoundError()
 
         with open(info_path, 'r') as f:
             info = json.load(f)
         cur_length = info['upload_length']
-        length = env.values['upload_length']
+        length = env.info['upload_length']
         if cur_length != -1 and length != cur_length:
             raise ConflictUploadLengthError()
-        if cur_length == -1 and length >= 0:
-            info['upload_length'] = length
-            with open(info_path) as f:
-                json.dump(info, f)
-        else:
-            os.utime(info_path, None)
 
+        body = env.req.body_file
         with open(fpath, 'ab+') as f:
             f.seek(0, os.SEEK_END)
             body.seek(0)
-            while True:
-                chunk = body.read(2 << 16)
-                if not chunk:
-                    break
-                f.write(chunk)
+            shutil.copyfileobj(body, f)
             offset = f.tell()
+
+        if cur_length == -1 and length >= 0:
+            info['upload_length'] = length
+            with open(info_path, 'w') as f:
+                json.dump(info, f)
+        else:
+            os.utime(info_path, None)
 
         return offset
 
