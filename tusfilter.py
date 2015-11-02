@@ -5,12 +5,20 @@ import time
 import json
 import uuid
 import webob
-import base64
 import shutil
 import hashlib
-import httplib
-import urlparse
 from collections import namedtuple
+from base64 import standard_b64decode, standard_b64encode
+
+try:
+    import httplib
+except ImportError:
+    import http.client as httplib
+
+try:
+    import urlparse
+except ImportError:
+    import urllib.parse as urlparse
 
 
 class Error(Exception):
@@ -153,6 +161,14 @@ class ModifyFinalError(Error):
     reason = 'Modifying A Final Upload Is Not Allowed'
 
 
+def b64_encode(s, encoding='utf-8'):
+    return standard_b64encode(s.encode(encoding)).decode(encoding)
+
+
+def b64_decode(s, encoding='utf-8'):
+    return standard_b64decode(s.encode(encoding)).decode(encoding)
+
+
 # req: webob request object
 # resp: webob response object
 # temp: temp data
@@ -275,8 +291,8 @@ class TusFilter(object):
             env.resp.headers['Upload-Length'] = str(upload_length)
 
         if upload_metadata:
-            env.resp.headers['Upload-Metadata'] = str(','.join(['%s %s' % (k, base64.standard_b64encode(v))
-                                                                for k, v in upload_metadata.items()]))
+            env.resp.headers['Upload-Metadata'] = ','.join(['%s %s' % (k, b64_encode(v))
+                                                            for k, v in upload_metadata.items()])
         parts = self.get_parts(env)
         if parts:
             env.resp.headers['Upload-Concat'] = 'final;' + ' '.join([self.get_url_from_uid(env, uid) for uid in parts])
@@ -294,7 +310,7 @@ class TusFilter(object):
             algorisum, checksum_base64 = upload_checksum.split(None, 1)
             if algorisum not in self.checksum_algorisums:
                 raise ChecksumAlgorisumsNotSuppertedError()
-            checksum = base64.standard_b64decode(checksum_base64)
+            checksum = standard_b64decode(checksum_base64.encode('utf-8'))
             body = env.req.body
             if checksum != hashlib.sha1(body).digest():
                 raise ChecksumMismatchError()
@@ -366,7 +382,7 @@ class TusFilter(object):
             except ValueError:
                 raise InvalidUploadMetadataError()
             try:
-                upload_metadata[k] = base64.standard_b64decode(v)
+                upload_metadata[k] = b64_decode(v)
             except:
                 raise InvalidUploadMetadataError()
         env.info['upload_metadata'] = upload_metadata
@@ -399,7 +415,10 @@ class TusFilter(object):
         if config['partial']:
             return
         env.temp['upload_finished'] = True
-        env.req.body = self.get_fpath(env) if not self.send_file else open(self.get_fpath(env), 'rb').read()
+        if self.send_file:
+            env.req.body = open(self.get_fpath(env), 'rb').read()
+        else:
+            env.req.body = self.get_fpath(env).encode('utf-8')
 
     def create_files(self, env):
         self.cleanup()
