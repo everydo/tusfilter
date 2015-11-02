@@ -9,7 +9,7 @@ with open(os.path.join(here, 'README.rst')) as f:
 
 setup(
     name='tusfilter',
-    version='0.4.0',
+    version='0.5.0',
     description='python wsgi filter for tus protocol 1.0.0',
     long_description=long_description,
     url='https://github.com/everydo/tusfilter',
@@ -32,5 +32,4 @@ setup(
         'Topic :: Internet :: WWW/HTTP :: WSGI :: Middleware',
         'License :: OSI Approved :: MIT License',
     ],
-
 )
