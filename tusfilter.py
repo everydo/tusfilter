@@ -221,7 +221,6 @@ class TusFilter(object):
         if env.info.get('parts') and app_resp.status == http.OK:
             return resp(environ, start_response)
 
-        self.delete_info_file(env)
         return app_resp(environ, start_response)
 
     def handle(self, env):
@@ -462,16 +461,11 @@ class TusFilter(object):
 
     def delete_files(self, env):
         fpath = self.get_fpath(env)
-        if not os.path.exists(fpath):
-            raise NotFoundError()
-        os.remove(fpath)
-        self.delete_info_file(env)
-
-    def delete_info_file(self, env):
         info_path = self.get_info_path(env)
-        if not os.path.exists(info_path):
-            raise NotFoundError()
-        os.remove(info_path)
+        if os.path.exists(fpath):
+            os.remove(fpath)
+        if os.path.exists(info_path):
+            os.remove(info_path)
 
     def check_files(self, env):
         fpath = self.get_fpath(env)
