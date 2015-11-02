@@ -174,7 +174,7 @@ class TusFilter(object):
         # 'concatenation-unfinished',  # todo
     ]
 
-    def __init__(self, app, upload_path, tmp_dir='/tmp/upload', expire=60*60*60, send_file=False, max_size=2**30):
+    def __init__(self, app, upload_path, tmp_dir='/tmp/upload', expire=60*60*24*30, send_file=False, max_size=2**30):
         self.app = app
         self.tmp_dir = tmp_dir
         self.upload_path = upload_path
