@@ -272,7 +272,7 @@ class TusFilter(object):
         self.create_files(env)
 
         env.resp.headers['Upload-Expires'] = self.get_fexpires(env)
-        env.resp.headers['Location'] = os.path.join(self.upload_path, env.temp['uid'])
+        env.resp.headers['Location'] = '/'.join([self.upload_path, env.temp['uid']])
         env.resp.status = http.CREATED
 
     def head(self, env):
@@ -398,7 +398,7 @@ class TusFilter(object):
     def get_url_from_uid(self, env, uid=None):
         if not uid:
             uid = env.temp['uid']
-        url = os.path.join(self.upload_path, uid)
+        url = '/'.join([self.upload_path, uid])
         return url
 
     def delete(self, env):
