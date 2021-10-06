@@ -566,7 +566,7 @@ class TusFilter(object):
         if cur_length != -1 and length != cur_length:
             raise ConflictUploadLengthError()
 
-        body = env.req.body_file
+        body = env.req.body_file_seekable
         with open(fpath, 'ab+') as f:
             f.seek(0, os.SEEK_END)
             body.seek(0)
